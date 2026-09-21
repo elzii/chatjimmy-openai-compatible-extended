@@ -9,15 +9,15 @@ from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from agent import run_agent
 
-# Persistent session store: session_id -> list of messages
 SESSION_STORE: Dict[str, List[Dict[str, str]]] = {}
+_FALLBACK_CLIENT: Optional[httpx.AsyncClient] = None
 
 
 @asynccontextmanager
@@ -48,16 +48,17 @@ MODEL_METADATA = {
 
 
 def get_client(request: Request) -> httpx.AsyncClient:
-    """Dependency provider guaranteeing an initialized httpx.AsyncClient."""
+    """Provides client pool, falling back to singleton so 503 never occurs."""
     client: Optional[httpx.AsyncClient] = getattr(
         request.app.state, "http_client", None
     )
-    if client is None:
-        raise HTTPException(
-            status_code=503,
-            detail="HTTP client pool is not initialized.",
-        )
-    return client
+    if client is not None:
+        return client
+
+    global _FALLBACK_CLIENT
+    if _FALLBACK_CLIENT is None:
+        _FALLBACK_CLIENT = httpx.AsyncClient(timeout=180.0)
+    return _FALLBACK_CLIENT
 
 
 class ChatMessage(BaseModel):
@@ -77,6 +78,16 @@ async def list_models():
     return {"object": "list", "data": [MODEL_METADATA]}
 
 
+@app.post("/v1/chat/reset")
+async def reset_session(
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
+):
+    """Clear conversational memory."""
+    session_id = x_session_id or "default"
+    SESSION_STORE.pop(session_id, None)
+    return {"status": "cleared", "session_id": session_id}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     body: ChatCompletionRequest,
@@ -87,11 +98,8 @@ async def chat_completions(
         {"role": msg.role, "content": msg.content} for msg in body.messages
     ]
 
-    # Session identifier defaults to "default" so simple curl calls retain memory
     session_id = x_session_id or "default"
 
-    # If client manages full history (sends multiple messages), adopt it.
-    # If client sends single messages incrementally (e.g. curl), append to session.
     if len(incoming) > 1:
         convo_history = incoming
         SESSION_STORE[session_id] = list(incoming)
@@ -107,7 +115,7 @@ async def chat_completions(
         enable_tools=bool(body.enable_tools),
     )
 
-    # Save assistant response to session store
+    # Save only the clean final assistant answer to memory
     SESSION_STORE[session_id].append({"role": "assistant", "content": output})
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"

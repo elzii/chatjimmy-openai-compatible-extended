@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """agent.py - FastMCP tool runner and multi-turn agent loop."""
 
 import json
@@ -27,7 +26,7 @@ mcp = FastMCP("JimmyTools")
 
 @mcp.tool()
 def get_current_weather(city: str) -> str:
-    """Get the current weather conditions for a given city."""
+    """Get current weather conditions for a given city."""
     return json.dumps(
         {"city": city, "temperature": "70°F", "condition": "Clear"}
     )
@@ -94,13 +93,8 @@ async def call_upstream(
 
 
 def find_tool_calls(text: str) -> List[Dict[str, Any]]:
-    """
-    Extracts all JSON tool calls from text using raw_decode to support
-    both code blocks and multiple parallel JSON objects.
-    """
+    """Extract tool calls supporting code blocks or multiple JSON objects."""
     tool_calls: List[Dict[str, Any]] = []
-
-    # Check for markdown code blocks first
     code_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     candidates = code_blocks if code_blocks else [text]
 
@@ -142,13 +136,18 @@ async def run_agent(
     if enable_tools:
         schemas = await get_tool_schemas()
         system_prompt = (
-            "You are an AI assistant with access to local tools.\n"
-            "To use tools, reply ONLY with a JSON object or array of objects:\n"
+            "You are a helpful AI assistant.\n"
+            "You have access to tools when required. To use them, output "
+            "ONLY a JSON block:\n"
             "```json\n"
             '{"tool": "tool_name", "arguments": {"arg": "val"}}\n'
             "```\n"
-            f"Available tools:\n{json.dumps(schemas, indent=2)}\n"
-            "If no tool is needed, answer the user normally in plain text."
+            f"Available tools:\n{json.dumps(schemas, indent=2)}\n\n"
+            "CRITICAL RULES:\n"
+            "1. If no tool is required, reply directly to the user in normal "
+            "conversational text. Do NOT mention tools.\n"
+            "2. When tool results are provided to you, answer the user's "
+            "question directly. Never describe the JSON or mention tool names."
         )
 
     for _ in range(max_turns):
@@ -167,10 +166,9 @@ async def run_agent(
         if not tool_calls:
             return content
 
-        # Append assistant's tool invocation to history
+        # Intermediate scratchpad for tools
         history.append({"role": "assistant", "content": content})
 
-        # Execute all detected tool calls
         results: List[str] = []
         for tc in tool_calls:
             t_name = str(tc.get("tool", ""))
@@ -185,13 +183,17 @@ async def run_agent(
                     res_str = str(res)
             except Exception as exc:
                 res_str = f"Error: {exc}"
-            results.append(f"Tool '{t_name}' result: {res_str}")
+            results.append(f"{t_name}: {res_str}")
 
-        # Feed tool outputs back to LLM for final natural-language response
         history.append(
             {
                 "role": "user",
-                "content": "[Tool Output]:\n" + "\n".join(results),
+                "content": (
+                    "Tool execution results:\n"
+                    + "\n".join(results)
+                    + "\n\nProvide the final answer to the user now based on "
+                    "these results. Speak naturally and directly."
+                ),
             }
         )
 
