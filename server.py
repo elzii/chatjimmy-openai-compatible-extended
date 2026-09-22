@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""server.py - OpenAI-compatible FastAPI server with automatic memory."""
+"""server.py - OpenAI-compatible server supporting IDE file attachments."""
 
 import json
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from agent import run_agent
 
@@ -48,7 +48,7 @@ MODEL_METADATA = {
 
 
 def get_client(request: Request) -> httpx.AsyncClient:
-    """Provides client pool, falling back to singleton so 503 never occurs."""
+    """Provides client pool, falling back to singleton if uninitialized."""
     client: Optional[httpx.AsyncClient] = getattr(
         request.app.state, "http_client", None
     )
@@ -61,21 +61,76 @@ def get_client(request: Request) -> httpx.AsyncClient:
     return _FALLBACK_CLIENT
 
 
+def normalize_content(content: Any) -> str:
+    """Normalizes string or multipart list payloads into plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                # Standard OpenAI text part
+                if "text" in item and isinstance(item["text"], str):
+                    name = item.get("name") or item.get("filename")
+                    if name:
+                        parts.append(
+                            f"--- File: {name} ---\n{item['text']}\n--- End ---"
+                        )
+                    else:
+                        parts.append(item["text"])
+                # OpenCode / IDE file reference block
+                elif "file" in item:
+                    f_info = item["file"]
+                    if isinstance(f_info, dict):
+                        fname = f_info.get("name", "attached_file")
+                        fcontent = f_info.get("content", "")
+                        parts.append(
+                            f"--- File: {fname} ---\n{fcontent}\n--- End ---"
+                        )
+                    else:
+                        parts.append(str(f_info))
+                else:
+                    parts.append(json.dumps(item))
+            else:
+                parts.append(str(item))
+        return "\n\n".join(parts)
+    return str(content)
+
+
+# --- Request Schemas with Permissive Config ---
+
+
 class ChatMessage(BaseModel):
-    role: str
-    content: str
+    model_config = ConfigDict(extra="allow")
+
+    role: Optional[str] = "user"
+    content: Optional[Any] = ""
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     model: Optional[str] = "llama3.1-8B"
     messages: List[ChatMessage]
     stream: Optional[bool] = False
     enable_tools: Optional[bool] = True
 
 
+# --- Endpoints ---
+
+
 @app.get("/v1/models")
 async def list_models():
     return {"object": "list", "data": [MODEL_METADATA]}
+
+
+@app.get("/v1/models/{model_id}")
+async def get_model(model_id: str):
+    return MODEL_METADATA
 
 
 @app.post("/v1/chat/reset")
@@ -94,12 +149,18 @@ async def chat_completions(
     client: httpx.AsyncClient = Depends(get_client),
     x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
 ):
+    # Normalize complex message formats into plain text role/content dicts
     incoming: List[Dict[str, str]] = [
-        {"role": msg.role, "content": msg.content} for msg in body.messages
+        {
+            "role": msg.role or "user",
+            "content": normalize_content(msg.content),
+        }
+        for msg in body.messages
     ]
 
     session_id = x_session_id or "default"
 
+    # If the IDE sends the entire history on each turn, adopt it directly
     if len(incoming) > 1:
         convo_history = incoming
         SESSION_STORE[session_id] = list(incoming)
@@ -115,7 +176,7 @@ async def chat_completions(
         enable_tools=bool(body.enable_tools),
     )
 
-    # Save only the clean final assistant answer to memory
+    # Cache assistant turn in session
     SESSION_STORE[session_id].append({"role": "assistant", "content": output})
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
