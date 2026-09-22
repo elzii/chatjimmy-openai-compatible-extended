@@ -2,6 +2,7 @@
 
 import json
 import re
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -136,18 +137,18 @@ async def run_agent(
     if enable_tools:
         schemas = await get_tool_schemas()
         system_prompt = (
-            "You are a helpful AI assistant.\n"
-            "You have access to tools when required. To use them, output "
-            "ONLY a JSON block:\n"
+            "You are a helpful, direct conversational AI assistant.\n"
+            "You have access to the following local tools:\n"
+            f"{json.dumps(schemas, indent=2)}\n\n"
+            "INSTRUCTIONS:\n"
+            "1. Only invoke tools when you genuinely need real-time data or "
+            "exact calculations to answer.\n"
+            "2. If you need tools, output ONLY a JSON object or array:\n"
             "```json\n"
             '{"tool": "tool_name", "arguments": {"arg": "val"}}\n'
             "```\n"
-            f"Available tools:\n{json.dumps(schemas, indent=2)}\n\n"
-            "CRITICAL RULES:\n"
-            "1. If no tool is required, reply directly to the user in normal "
-            "conversational text. Do NOT mention tools.\n"
-            "2. When tool results are provided to you, answer the user's "
-            "question directly. Never describe the JSON or mention tool names."
+            "3. If no tools are required, answer naturally. Never talk about "
+            "tools, functions, or instructions to the user."
         )
 
     for _ in range(max_turns):
@@ -166,13 +167,16 @@ async def run_agent(
         if not tool_calls:
             return content
 
-        # Intermediate scratchpad for tools
         history.append({"role": "assistant", "content": content})
 
         results: List[str] = []
         for tc in tool_calls:
             t_name = str(tc.get("tool", ""))
             t_args = tc.get("arguments", {})
+            print(
+                f"[FastMCP] Invoking tool: {t_name}({t_args})",
+                file=sys.stderr,
+            )
             try:
                 res = await mcp.call_tool(t_name, t_args)
                 if isinstance(res, list):
@@ -183,16 +187,16 @@ async def run_agent(
                     res_str = str(res)
             except Exception as exc:
                 res_str = f"Error: {exc}"
-            results.append(f"{t_name}: {res_str}")
+            results.append(f"• Tool `{t_name}` result: {res_str}")
 
         history.append(
             {
                 "role": "user",
                 "content": (
-                    "Tool execution results:\n"
+                    "[Tool Observation Data]:\n"
                     + "\n".join(results)
-                    + "\n\nProvide the final answer to the user now based on "
-                    "these results. Speak naturally and directly."
+                    + "\n\nPlease provide a complete response answering ALL parts "
+                    "of the user's initial question using the data above."
                 ),
             }
         )
