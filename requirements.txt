@@ -1,7 +1,7 @@
-fastapi
 uvicorn
+fastapi
+fastmcp
 pydantic
 sse-starlette
-fastmcp
 httpx
-playwright
+#playwright

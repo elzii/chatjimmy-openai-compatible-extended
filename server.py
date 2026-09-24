@@ -6,13 +6,13 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from agent import run_agent
 
@@ -60,12 +60,54 @@ def get_client(request: Request) -> httpx.AsyncClient:
     return client
 
 
+def normalize_content(content: Any) -> str:
+    """Normalizes string or multipart list payloads into plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if "text" in item and isinstance(item["text"], str):
+                    name = item.get("name") or item.get("filename")
+                    if name:
+                        parts.append(
+                            f"--- File: {name} ---\n{item['text']}\n--- End ---"
+                        )
+                    else:
+                        parts.append(item["text"])
+                elif "file" in item:
+                    f_info = item["file"]
+                    if isinstance(f_info, dict):
+                        fname = f_info.get("name", "attached_file")
+                        fcontent = f_info.get("content", "")
+                        parts.append(
+                            f"--- File: {fname} ---\n{fcontent}\n--- End ---"
+                        )
+                    else:
+                        parts.append(str(f_info))
+                else:
+                    parts.append(json.dumps(item))
+            else:
+                parts.append(str(item))
+        return "\n\n".join(parts)
+    return str(content)
+
+
 class ChatMessage(BaseModel):
-    role: str
-    content: str
+    model_config = ConfigDict(extra="allow")
+
+    role: Optional[str] = "user"
+    content: Optional[Any] = ""
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     model: Optional[str] = "llama3.1-8B"
     messages: List[ChatMessage]
     stream: Optional[bool] = False
@@ -77,6 +119,21 @@ async def list_models():
     return {"object": "list", "data": [MODEL_METADATA]}
 
 
+@app.get("/v1/models/{model_id}")
+async def get_model(model_id: str):
+    return MODEL_METADATA
+
+
+@app.post("/v1/chat/reset")
+async def reset_session(
+    x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
+):
+    """Clear conversational memory."""
+    session_id = x_session_id or "default"
+    SESSION_STORE.pop(session_id, None)
+    return {"status": "cleared", "session_id": session_id}
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     body: ChatCompletionRequest,
@@ -84,14 +141,16 @@ async def chat_completions(
     x_session_id: Optional[str] = Header(None, alias="X-Session-ID"),
 ):
     incoming: List[Dict[str, str]] = [
-        {"role": msg.role, "content": msg.content} for msg in body.messages
+        {
+            "role": msg.role or "user",
+            "content": normalize_content(msg.content),
+        }
+        for msg in body.messages
     ]
 
-    # Session identifier defaults to "default" so simple curl calls retain memory
     session_id = x_session_id or "default"
 
-    # If client manages full history (sends multiple messages), adopt it.
-    # If client sends single messages incrementally (e.g. curl), append to session.
+    # Multi-turn history management
     if len(incoming) > 1:
         convo_history = incoming
         SESSION_STORE[session_id] = list(incoming)
@@ -107,7 +166,6 @@ async def chat_completions(
         enable_tools=bool(body.enable_tools),
     )
 
-    # Save assistant response to session store
     SESSION_STORE[session_id].append({"role": "assistant", "content": output})
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"

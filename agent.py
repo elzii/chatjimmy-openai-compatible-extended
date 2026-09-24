@@ -1,8 +1,9 @@
-"""agent.py - FastMCP tool runner with gated tools and conversational prompt."""
+"""agent.py - FastMCP tool runner with gated filesystem and coding tools."""
 
 from datetime import datetime
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -31,8 +32,184 @@ mcp = FastMCP("JimmyTools")
 
 
 # -----------------------------------------------------------------------------
-# FastMCP Tools (with docstring-level gating)
+# FastMCP Tools (Docstring-Gated)
 # -----------------------------------------------------------------------------
+
+
+@mcp.tool()
+def read_file(path: str, max_lines: int = 500) -> str:
+    """
+    Read contents of a local text or code file.
+    Use when the user asks to read, explain, inspect, or summarize a file.
+    """
+    target = Path(path).expanduser().resolve()
+    if not target.exists():
+        return f"Error: File not found: {path}"
+    if not target.is_file():
+        return f"Error: Path is not a file: {path}"
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        total = len(lines)
+        clipped = lines[:max_lines]
+        result = "\n".join(clipped)
+        if total > max_lines:
+            result += f"\n\n[... Truncated {total - max_lines} lines ...]"
+        return result
+    except Exception as exc:
+        return f"Error reading file {path}: {exc}"
+
+
+@mcp.tool()
+def list_directory(path: str = ".") -> str:
+    """
+    List files and directories in a given folder.
+    Use when the user asks what files exist or to explore project layout.
+    """
+    target = Path(path).expanduser().resolve()
+    if not target.exists():
+        return f"Error: Path does not exist: {path}"
+    if not target.is_dir():
+        return f"Error: Path is not a directory: {path}"
+
+    entries: List[str] = []
+    try:
+        for item in sorted(target.iterdir()):
+            if item.name.startswith(".git"):
+                continue
+            marker = "/" if item.is_dir() else ""
+            size = (
+                f" ({item.stat().st_size} bytes)" if item.is_file() else ""
+            )
+            entries.append(f"{item.name}{marker}{size}")
+        return "\n".join(entries) if entries else "(empty directory)"
+    except Exception as exc:
+        return f"Error listing directory: {exc}"
+
+
+@mcp.tool()
+def write_file(path: str, content: str) -> str:
+    """
+    Create a new file or completely overwrite an existing file.
+    Use when the user asks to create, save, or write a file.
+    """
+    target = Path(path).expanduser().resolve()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return f"Successfully wrote {len(content)} characters to {path}."
+    except Exception as exc:
+        return f"Error writing file {path}: {exc}"
+
+
+@mcp.tool()
+def edit_file(path: str, target: str, replacement: str) -> str:
+    """
+    Replace an exact code snippet in a file with new replacement text.
+    Use when the user asks to update, modify, or patch code in an existing file.
+    """
+    p = Path(path).expanduser().resolve()
+    if not p.is_file():
+        return f"Error: File does not exist: {path}"
+    try:
+        original = p.read_text(encoding="utf-8")
+        if target not in original:
+            return (
+                f"Error: Target text not found in {path}. "
+                "Ensure exact match including whitespace and indentation."
+            )
+        count = original.count(target)
+        updated = original.replace(target, replacement, 1)
+        p.write_text(updated, encoding="utf-8")
+        return f"Successfully updated {path} (1 of {count} matches)."
+    except Exception as exc:
+        return f"Error editing file {path}: {exc}"
+
+
+@mcp.tool()
+def search_code(
+    pattern: str,
+    path: str = ".",
+    max_results: int = 30,
+) -> str:
+    """
+    Search for text or regex pattern across code files.
+    Use when searching for functions, variables, or keywords in a project.
+    """
+    root = Path(path).expanduser().resolve()
+    if not root.exists():
+        return f"Error: Path does not exist: {path}"
+
+    rg_installed = subprocess.run(
+        "command -v rg", shell=True, capture_output=True
+    ).returncode == 0
+
+    if rg_installed:
+        cmd = [
+            "rg",
+            "--max-count", "5",
+            "--max-columns", "150",
+            "--glob", "!.git",
+            "--glob", "!node_modules",
+            "--glob", "!__pycache__",
+            "--glob", "!.venv",
+            pattern,
+            str(root),
+        ]
+    else:
+        cmd = [
+            "grep",
+            "-rnI",
+            "--exclude-dir={.git,node_modules,__pycache__,.venv}",
+            f"--max-count={max_results}",
+            pattern,
+            str(root),
+        ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        lines = [
+            line.strip() for line in proc.stdout.splitlines() if line.strip()
+        ]
+        if not lines:
+            return f"No matches found for: '{pattern}'"
+        clipped = lines[:max_results]
+        out = "\n".join(clipped)
+        if len(lines) > max_results:
+            out += f"\n\n[... Truncated at {max_results} matches ...]"
+        return out
+    except Exception as exc:
+        return f"Search execution failed: {exc}"
+
+
+@mcp.tool()
+def execute_shell(command: str, timeout_seconds: int = 30) -> str:
+    """
+    Execute a local shell command.
+    Use ONLY when the user explicitly asks to run a command, script, or test.
+    """
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            cwd=os.getcwd(),
+        )
+        stdout = proc.stdout.strip()
+        stderr = proc.stderr.strip()
+        out = []
+        if stdout:
+            out.append(f"STDOUT:\n{stdout}")
+        if stderr:
+            out.append(f"STDERR:\n{stderr}")
+        out.append(f"Exit Code: {proc.returncode}")
+        return "\n\n".join(out)
+    except subprocess.TimeoutExpired:
+        return f"Command timed out after {timeout_seconds} seconds."
+    except Exception as exc:
+        return f"Command execution failed: {exc}"
 
 
 @mcp.tool()
@@ -83,36 +260,6 @@ def evaluate_math(expression: str) -> str:
         return str(eval(expression, {"__builtins__": None}, {}))
     except Exception as exc:
         return f"Error: {exc}"
-
-
-@mcp.tool()
-def execute_shell(command: str, timeout_seconds: int = 30) -> str:
-    """
-    Execute a local shell command.
-    Use ONLY when the user explicitly asks to run a command or script.
-    """
-    try:
-        proc = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            cwd=os.getcwd(),
-        )
-        stdout = proc.stdout.strip()
-        stderr = proc.stderr.strip()
-        out = []
-        if stdout:
-            out.append(f"STDOUT:\n{stdout}")
-        if stderr:
-            out.append(f"STDERR:\n{stderr}")
-        out.append(f"Exit Code: {proc.returncode}")
-        return "\n\n".join(out)
-    except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout_seconds} seconds."
-    except Exception as exc:
-        return f"Command execution failed: {exc}"
 
 
 # -----------------------------------------------------------------------------
@@ -217,19 +364,25 @@ async def run_agent(
     if enable_tools:
         schemas = await get_tool_schemas()
         system_prompt = (
-            "You are a friendly, direct conversational AI assistant.\n"
+            "You are a friendly, direct conversational software engineering "
+            "assistant.\n"
             "When the user greets you, introduces themselves, chats casually, "
-            "or asks about previous messages, reply directly in natural text.\n\n"
-            "You have access to tools for specific external tasks:\n"
+            "or asks about previous conversation history, reply directly in "
+            "natural text.\n\n"
+            "You have direct access to tools for local files, shell commands, "
+            "and system data:\n"
             f"{json.dumps(schemas, indent=2)}\n\n"
             "TOOL CALLING RULES:\n"
-            "- Call a tool ONLY when the user's latest request specifically "
-            "requires that tool's capability.\n"
+            "- When asked to inspect, read, or explain a file (e.g. 'what does "
+            "server.py do?'), use `read_file`.\n"
+            "- When asked what files exist or to look around, use "
+            "`list_directory`.\n"
+            "- When asked to run a command or script, use `execute_shell`.\n"
             "- When you need to call a tool, respond with ONLY a JSON block:\n"
             "```json\n"
             '{"tool": "tool_name", "arguments": {"arg": "val"}}\n'
             "```\n"
-            "- Otherwise, respond with plain text."
+            "- Otherwise, respond directly in plain text."
         )
 
     for _ in range(max_turns):
