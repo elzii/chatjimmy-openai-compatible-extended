@@ -8,7 +8,7 @@
 ## 🚀 Getting Started
 
 ```bash
-# [⚠️ OPTIONAL] Use a virtual environment with `python3 -m venv venv` then `source venv/bin/activate`
+# [❓ OPTIONAL] Use a virtual environment with `python3 -m venv venv` then `source venv/bin/activate`
 
 # Otherwise, install the dependencies in requirements.txt file with:
 python3 -m pip install -r requirements.txt
@@ -19,6 +19,10 @@ python3 server.py
 
 **NOTE:** The default port is 4100. You can override it by setting the `PORT` environment variable. Also, if you wish to iterate on it, since it uses uvicorn, it will automatically reload on code changes to it.
 
+
+
+## ⚠️ WARNINGS
+- There is a bug where writing files will sometimes write to the directory where the `server.py` of this project is located, instead of the current working directory. It is less common when using the specifying a path or using the `@` helper most CLI tools have.
 
 
 ## 📋 TODO
